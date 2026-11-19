@@ -23,6 +23,16 @@ v11 — Optimisations performance (200+ contrats) :
      → factures et subsides verrouillés simultanément (N workers)
      → la création des brouillons Outlook reste séquentielle (COM non thread-safe)
   10. Skip des PDFs déjà verrouillés (reprise après erreur sans re-traitement)
+
+v12 — Optimisations & fiabilité :
+  11. Dossier Brouillons + SMTP résolus UNE seule fois (plus de parcours des
+      Stores Outlook à chaque mail → ~200 appels COM économisés)
+  12. Lecture Excel unique (détection d'en-tête sur les données déjà chargées)
+  13. Cellules vides : fillna("") → plus de "nan" dans les mails / contrats
+  14. Recherche facture partielle stricte : le contrat 123 ne matche plus 1234
+  15. Skip PDF verrouillé seulement s'il est plus récent que la source
+      (évite d'envoyer la facture du mois précédent)
+  16. Barre de progression sur le verrouillage parallèle
 """
 
 from pathlib import Path
@@ -263,16 +273,37 @@ def get_store_and_drafts_folder(outlook, store_display_name: str):
 # FIX 3 — Détection automatique de la ligne d'en-tête Excel
 # ---------------------------------------------------------
 
-def detect_header_row(excel_path: Path, target_col: str, max_scan: int = 20) -> int:
-    try:
-        raw = pd.read_excel(excel_path, engine="openpyxl", dtype=str, header=None, nrows=max_scan)
-        for i, row_data in raw.iterrows():
-            if any(str(cell).strip() == target_col for cell in row_data):
-                logging.info(f"En-tête détecté à la ligne {i} (0-based).")
-                return i
-    except Exception as e:
-        logging.warning(f"Détection d'en-tête échouée : {e}. Utilisation de header=0.")
-    return 0
+def load_excel(excel_path: Path, target_col: str, max_scan: int = 20) -> tuple[pd.DataFrame, int]:
+    """
+    v12 — Lit le fichier Excel UNE seule fois, détecte la ligne d'en-tête
+    (celle qui contient target_col) et renvoie (DataFrame, index_ligne_entete).
+    Les cellules vides sont remplacées par "" (au lieu de NaN → "nan").
+    """
+    raw = pd.read_excel(excel_path, engine="openpyxl", dtype=str, header=None).fillna("")
+
+    header_row = 0
+    for i in range(min(max_scan, len(raw))):
+        if (raw.iloc[i].str.strip() == target_col).any():
+            header_row = i
+            logging.info(f"En-tête détecté à la ligne {i} (0-based).")
+            break
+    else:
+        logging.warning(f"'{target_col}' introuvable dans les {max_scan} premières lignes. header=0.")
+
+    # Noms de colonnes nettoyés + dédoublonnés (comme pandas : "Col", "Col.1", ...)
+    columns, seen = [], {}
+    for c in raw.iloc[header_row]:
+        name = str(c).strip()
+        if name in seen:
+            seen[name] += 1
+            name = f"{name}.{seen[name]}"
+        else:
+            seen[name] = 0
+        columns.append(name)
+
+    df = raw.iloc[header_row + 1:].reset_index(drop=True)
+    df.columns = columns
+    return df, header_row
 
 
 # ---------------------------------------------------------
@@ -317,17 +348,20 @@ def lock_pdf(input_path: Path, output_path: Path, password: str) -> tuple[bool, 
 # v11 — OPT 8 : Pré-indexation des PDFs en dictionnaires
 # ---------------------------------------------------------
 
+def normalize_name(text: str) -> str:
+    """Minuscules + espaces multiples réduits à un seul."""
+    return " ".join(text.split()).lower()
+
+
 def index_pdfs(folder: Path) -> dict[str, Path]:
     """
     Construit un dictionnaire {nom_normalise: path} pour tous les PDFs du dossier.
     Appelé une seule fois au démarrage, évite les glob répétés à chaque contrat.
-    La clé est le stem en minuscules avec espaces normalisés.
     """
     index = {}
     for p in folder.iterdir():
         if p.is_file() and p.suffix.lower() == ".pdf":
-            key = " ".join(p.stem.split()).lower()
-            index[key] = p
+            index[normalize_name(p.stem)] = p
     logging.info(f"{len(index)} PDFs indexés dans : {folder}")
     return index
 
@@ -336,15 +370,18 @@ def find_invoice_pdf(contract: str, pdf_index: dict[str, Path]) -> Path | None:
     """
     Cherche la facture d'un contrat dans l'index pré-construit.
     Stratégie : correspondance exacte, puis recherche partielle.
+    v12 : la recherche partielle exige que le contrat ne soit pas collé à
+    d'autres chiffres → "123" ne matche plus "facture 1234" ni "0123".
     """
-    # Correspondance exacte
-    exact = pdf_index.get(contract.lower())
+    key = normalize_name(contract)
+
+    exact = pdf_index.get(key)
     if exact:
         return exact
 
-    # Recherche partielle (contrat contenu dans le nom du fichier)
-    for key, path in pdf_index.items():
-        if contract.lower() in key:
+    pattern = re.compile(rf"(?<!\d){re.escape(key)}(?!\d)")
+    for name, path in pdf_index.items():
+        if pattern.search(name):
             return path
 
     return None
@@ -355,8 +392,7 @@ def find_subsidy_pdf(contract: str, subsidy_index: dict[str, Path]) -> Path | No
     Cherche le subside d'un contrat dans l'index pré-construit.
     Convention : "FG {contract}" (insensible à la casse).
     """
-    expected = f"FG {contract}".lower()
-    return subsidy_index.get(expected)
+    return subsidy_index.get(normalize_name(f"FG {contract}"))
 
 
 # ---------------------------------------------------------
@@ -379,28 +415,27 @@ def lock_all_pdfs_parallel(
     results = {}
 
     def _lock_one(contract, src, dst):
-        # OPT 10 : skip si déjà verrouillé
-        if dst.exists():
-            logging.info(f"[{contract}] PDF déjà verrouillé, skip : {dst.name}")
-            return contract, "skip", True, None, dst
+        # OPT 10 (v12) : skip seulement si la copie verrouillée est plus récente
+        # que la source — sinon c'est probablement celle du mois précédent.
+        if dst.exists() and dst.stat().st_mtime >= src.stat().st_mtime:
+            logging.debug(f"[{contract}] PDF déjà verrouillé, skip : {dst.name}")
+            return True, None, dst
         ok, err = lock_pdf(src, dst, password)
-        return contract, "lock", ok, err, dst
+        return ok, err, dst
 
-    futures = []
     with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {}  # future -> (contract, kind)
         for (contract, pdf_input, locked_facture, subsidy_input, locked_subsidy) in lock_tasks:
-            # Soumettre le verrouillage de la facture
-            futures.append(("facture", contract, executor.submit(_lock_one, contract, pdf_input, locked_facture)))
-            # Soumettre le verrouillage du subside si présent
+            results[contract] = {"facture": None, "subside": None}
+            futures[executor.submit(_lock_one, contract, pdf_input, locked_facture)] = (contract, "facture")
             if subsidy_input and locked_subsidy:
-                futures.append(("subside", contract, executor.submit(_lock_one, contract, subsidy_input, locked_subsidy)))
+                futures[executor.submit(_lock_one, contract, subsidy_input, locked_subsidy)] = (contract, "subside")
 
-        for kind, contract, future in futures:
-            if contract not in results:
-                results[contract] = {"facture": None, "subside": None}
+        # as_completed : on récupère les résultats dès qu'ils sont prêts → progression réelle
+        for future in tqdm(as_completed(futures), total=len(futures), desc="Verrouillage PDF"):
+            contract, kind = futures[future]
             try:
-                _, action, ok, err, dst = future.result()
-                results[contract][kind] = (ok, err, dst)
+                results[contract][kind] = future.result()
             except Exception as e:
                 results[contract][kind] = (False, str(e), None)
 
@@ -417,9 +452,15 @@ def create_outlook_draft_in_store(
     subject: str,
     body: str,
     attachment_paths: list[Path],
-    store_display_name: str | None,
+    drafts_folder,
+    smtp: str = "",
     locked_paths: list[Path] | None = None
 ) -> tuple[bool, str | None]:
+    """
+    v12 : reçoit directement le dossier Brouillons (résolu une seule fois dans
+    main) au lieu de re-parcourir tous les Stores Outlook à chaque mail.
+    drafts_folder=None → boîte par défaut.
+    """
 
     def _attach_all(mail):
         for p in attachment_paths:
@@ -434,12 +475,8 @@ def create_outlook_draft_in_store(
                 except Exception as cleanup_err:
                     logging.warning(f"Impossible de supprimer {p.name} : {cleanup_err}")
 
-    if store_display_name is not None:
+    if drafts_folder is not None:
         try:
-            _, drafts_folder, smtp = get_store_and_drafts_folder(outlook, store_display_name)
-            if drafts_folder is None:
-                raise Exception(f"Dossier Brouillons introuvable : {store_display_name}")
-
             mail = drafts_folder.Items.Add("IPM.Note")
             if smtp:
                 try:
@@ -461,7 +498,7 @@ def create_outlook_draft_in_store(
             return True, None
 
         except Exception as e:
-            logging.warning(f"Échec Store '{store_display_name}' : {e}. Tentative boîte par défaut.")
+            logging.warning(f"Échec dossier Brouillons du Store : {e}. Tentative boîte par défaut.")
 
     try:
         mail = outlook.CreateItem(0)
@@ -470,7 +507,7 @@ def create_outlook_draft_in_store(
         mail.Body = body
         _attach_all(mail)
         mail.Save()
-        fallback_msg = "Fallback boîte par défaut" if store_display_name is not None else "Boîte par défaut"
+        fallback_msg = "Fallback boîte par défaut" if drafts_folder is not None else "Boîte par défaut"
         return True, fallback_msg
 
     except Exception as e2:
@@ -492,6 +529,15 @@ def main():
     if not store_choice:
         logging.warning("Aucune boîte sélectionnée. Les brouillons iront dans la boîte par défaut.")
         store_choice = None
+
+    # v12 OPT 11 — Résolution unique du dossier Brouillons + adresse SMTP
+    drafts_folder, smtp = None, ""
+    if store_choice:
+        _, drafts_folder, smtp = get_store_and_drafts_folder(outlook, store_choice)
+        if drafts_folder is None:
+            logging.warning(f"Brouillons introuvables pour '{store_choice}'. Boîte par défaut utilisée.")
+        else:
+            logging.info(f"Brouillons cible : {store_choice} ({smtp or 'SMTP inconnu'})")
 
     if test_mode:
         logging.info(f"Mode Test activé : seulement {TEST_ROWS} lignes seront traitées.")
@@ -515,9 +561,8 @@ def main():
     locked_folder = pdf_folder / "Factures_Locked"
     locked_folder.mkdir(parents=True, exist_ok=True)
 
-    # FIX 3 : détection automatique de la ligne d'en-tête
-    header_row = detect_header_row(excel_file, CONTRACT_COL)
-    df = pd.read_excel(excel_file, engine="openpyxl", dtype=str, header=header_row)
+    # FIX 3 + v12 OPT 12/13 : lecture unique, en-tête auto, cellules vides = ""
+    df, header_row = load_excel(excel_file, CONTRACT_COL)
 
     if CONTRACT_COL not in df.columns:
         logging.error(f"Colonne '{CONTRACT_COL}' non trouvée (en-tête détecté ligne {header_row}).")
@@ -546,10 +591,11 @@ def main():
     valid_rows = []   # contrats à traiter
     success = 0
 
-    for _, row in df.iterrows():
-        contract = str(row.get(CONTRACT_COL, "")).strip()
+    # to_dict("records") : liste de dicts, bien plus rapide que df.iterrows()
+    for row in df.to_dict("records"):
+        contract = row.get(CONTRACT_COL, "").strip()
         email_facturation = get_email_from_row(row, email_cols)
-        responsable_email = str(row.get(RESPONSABLE_COL, "")).strip()
+        responsable_email = row.get(RESPONSABLE_COL, "").strip()
 
         if not contract:
             report_rows.append([contract, "", "SKIPPED", "Contrat manquant", ""])
@@ -625,7 +671,8 @@ def main():
             subject=subject,
             body=body,
             attachment_paths=attachment_paths,
-            store_display_name=store_choice,
+            drafts_folder=drafts_folder,
+            smtp=smtp,
             locked_paths=list(attachment_paths)
         )
 
